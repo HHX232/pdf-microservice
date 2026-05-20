@@ -53,7 +53,9 @@ class PdfController {
         });
       }
 
+      console.log(`📄 Extracting text: ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)`);
       const result = await pdfService.extractTextFromBuffer(req.file.buffer);
+      console.log(`✅ Extracted ${result.pageCount} pages, ${result.text.length} chars`);
 
       res.json({
         success: true,
@@ -197,7 +199,9 @@ class PdfController {
         });
       }
 
+      console.log(`📊 Extracting tables: ${req.file.originalname}`);
       const result = await pdfService.extractTablesFromBuffer(req.file.buffer);
+      console.log(`✅ Found ${result.count} tables`);
 
       res.json({
         success: true,
