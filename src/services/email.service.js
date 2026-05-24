@@ -1,19 +1,30 @@
 const nodemailer = require('nodemailer');
+const { resolve4 } = require('dns').promises;
 
 let _transporter = null;
 
-function getTransporter() {
+async function getTransporter() {
   if (_transporter) return _transporter;
 
+  const hostname = process.env.SMTP_HOST || 'smtp.gmail.com';
+
+  // Railway has no IPv6 routing — resolve to IPv4 explicitly
+  let host = hostname;
+  try {
+    const addrs = await resolve4(hostname);
+    if (addrs.length > 0) host = addrs[0];
+  } catch {
+    // fall back to hostname if DNS fails
+  }
+
   _transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host,
     port: Number(process.env.SMTP_PORT) || 587,
     secure: process.env.SMTP_SECURE === 'true',
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
     },
-    family: 4,
     connectionTimeout: 10000,
     greetingTimeout: 10000,
     socketTimeout: 15000,
@@ -32,7 +43,7 @@ function getTransporter() {
  * @param {string} [opts.from]
  */
 async function sendMail({ to, subject, html, text, from }) {
-  const transporter = getTransporter();
+  const transporter = await getTransporter();
   const fromAddress = from || process.env.SMTP_FROM || process.env.SMTP_USER;
 
   const info = await transporter.sendMail({
