@@ -52,11 +52,11 @@ async function sendMail({ to, subject, html, text, from }) {
  */
 async function sendOtp({ to, code, appName = 'GoodWorker', logoUrl }) {
   const subject = `${code} — код подтверждения ${appName}`;
-  const html = buildOtpHtml({ code, appName, logoUrl });
+  const html = buildOtpHtml({ code, appName, logoUrl, subject });
   return sendMail({ to, subject, html });
 }
 
-function buildOtpHtml({ code, appName, logoUrl }) {
+function buildOtpHtml({ code, appName, logoUrl, subject }) {
   const digits = code.split('');
   const digitBoxes = digits
     .map(
