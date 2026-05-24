@@ -1,36 +1,11 @@
-const nodemailer = require('nodemailer');
-const { resolve4 } = require('dns').promises;
+const { Resend } = require('resend');
 
-let _transporter = null;
+let _client = null;
 
-async function getTransporter() {
-  if (_transporter) return _transporter;
-
-  const hostname = process.env.SMTP_HOST || 'smtp.gmail.com';
-
-  // Railway has no IPv6 routing — resolve to IPv4 explicitly
-  let host = hostname;
-  try {
-    const addrs = await resolve4(hostname);
-    if (addrs.length > 0) host = addrs[0];
-  } catch {
-    // fall back to hostname if DNS fails
-  }
-
-  _transporter = nodemailer.createTransport({
-    host,
-    port: Number(process.env.SMTP_PORT) || 587,
-    secure: process.env.SMTP_SECURE === 'true',
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000,
-  });
-
-  return _transporter;
+function getClient() {
+  if (_client) return _client;
+  _client = new Resend(process.env.RESEND_API_KEY);
+  return _client;
 }
 
 /**
@@ -43,18 +18,19 @@ async function getTransporter() {
  * @param {string} [opts.from]
  */
 async function sendMail({ to, subject, html, text, from }) {
-  const transporter = await getTransporter();
-  const fromAddress = from || process.env.SMTP_FROM || process.env.SMTP_USER;
+  const client = getClient();
+  const fromAddress = from || process.env.RESEND_FROM || 'GoodWorker <onboarding@resend.dev>';
 
-  const info = await transporter.sendMail({
+  const { data, error } = await client.emails.send({
     from: fromAddress,
     to,
     subject,
     html,
-    text: text || html.replace(/<[^>]+>/g, ''),
+    text,
   });
 
-  return { messageId: info.messageId, accepted: info.accepted };
+  if (error) throw new Error(error.message ?? 'Resend error');
+  return { messageId: data.id, accepted: [to] };
 }
 
 /**

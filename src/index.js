@@ -1,6 +1,3 @@
-const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
-
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -76,8 +73,8 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 PDF + Email Service running on port ${PORT}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
-  if (!process.env.SMTP_HOST) {
-    console.warn('⚠️  SMTP_HOST not set — email sending will fail');
+  if (!process.env.RESEND_API_KEY) {
+    console.warn('⚠️  RESEND_API_KEY not set — email sending will fail');
   }
 });
 
