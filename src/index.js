@@ -6,6 +6,7 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const pdfRoutes = require('./routes/pdf.routes');
+const emailRoutes = require('./routes/email.routes');
 const errorHandler = require('./middleware/errorHandler');
 
 const app = express();
@@ -44,15 +45,16 @@ app.use(compression());
 
 // Health check
 app.get('/health', (_req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'pdf-processing-service',
+  res.json({
+    status: 'ok',
+    services: ['pdf', 'email'],
     timestamp: new Date().toISOString()
   });
 });
 
 // Routes
 app.use('/api/pdf', pdfRoutes);
+app.use('/api/email', emailRoutes);
 
 // Error handling
 app.use(errorHandler);
@@ -66,8 +68,11 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 PDF Processing Service running on port ${PORT}`);
+  console.log(`🚀 PDF + Email Service running on port ${PORT}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
+  if (!process.env.SMTP_HOST) {
+    console.warn('⚠️  SMTP_HOST not set — email sending will fail');
+  }
 });
 
 module.exports = app;
