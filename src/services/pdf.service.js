@@ -1,6 +1,17 @@
 const { PDFParse } = require('pdf-parse');
 const axios = require('axios');
 const XLSX = require('xlsx');
+const { createWorker } = require('tesseract.js');
+const mammoth = require('mammoth');
+const os = require('os');
+const fs = require('fs').promises;
+const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
+
+// Chars-per-page threshold below which we consider the PDF a scanned image
+const OCR_FALLBACK_THRESHOLD = 50;
 
 class PdfService {
   async generateExcelFromTables(tablesData) {
@@ -28,7 +39,7 @@ class PdfService {
   }
 }
   /**
-   * Extract text from PDF buffer
+   * Extract text from PDF buffer — falls back to OCR for scanned PDFs
    */
   async extractTextFromBuffer(buffer) {
     try {
@@ -36,16 +47,72 @@ class PdfService {
       const result = await parser.getText();
       await parser.destroy();
 
-      if (!result.text || result.text.trim().length === 0) {
-        throw new Error('No text content found in PDF');
+      const pageCount = result.total || result.pages?.length || 0;
+      const text = result.text?.trim() ?? '';
+
+      // Detect scanned PDF: very little text per page → use OCR on page screenshots
+      const charsPerPage = pageCount > 0 ? text.length / pageCount : text.length;
+      if (charsPerPage < OCR_FALLBACK_THRESHOLD) {
+        console.log(`📷 Scanned PDF detected (${Math.round(charsPerPage)} chars/page) — running OCR`);
+        try {
+          const ocrText = await this._ocrFromBuffer(buffer, pageCount);
+          if (ocrText.trim().length > text.length) {
+            return { text: ocrText.trim(), pageCount, ocr: true };
+          }
+        } catch (ocrErr) {
+          console.warn('⚠️  OCR failed, returning raw text:', ocrErr.message);
+        }
       }
 
-      return {
-        text: result.text.trim(),
-        pageCount: result.numpages || 0
-      };
+      if (!text) throw new Error('No text content found in PDF');
+      return { text, pageCount };
     } catch (error) {
       throw new Error(`Failed to extract text from PDF: ${error.message}`);
+    }
+  }
+
+  /**
+   * Run Tesseract OCR on a PDF buffer.
+   * Converts pages to JPEG via pdftoppm (poppler), then runs tesseract.js on each.
+   */
+  async _ocrFromBuffer(buffer) {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-ocr-'));
+    const pdfPath = path.join(tmpDir, 'input.pdf');
+
+    try {
+      await fs.writeFile(pdfPath, buffer);
+
+      // Convert all pages to JPEG at 200 dpi
+      await execFileAsync('pdftoppm', ['-r', '200', '-jpeg', pdfPath, path.join(tmpDir, 'page')]);
+
+      const pageFiles = (await fs.readdir(tmpDir))
+        .filter(f => f.startsWith('page') && f.endsWith('.jpg'))
+        .sort()
+        .map(f => path.join(tmpDir, f));
+
+      if (pageFiles.length === 0) throw new Error('pdftoppm produced no images');
+
+      console.log(`  OCR: ${pageFiles.length} pages via pdftoppm`);
+
+      const worker = await createWorker(['rus', 'eng'], 1, { logger: () => {} });
+      const texts = [];
+
+      for (let i = 0; i < pageFiles.length; i++) {
+        try {
+          const imageData = await fs.readFile(pageFiles[i]);
+          const { data: { text } } = await worker.recognize(imageData);
+          const trimmed = text.trim();
+          if (trimmed) texts.push(trimmed);
+          console.log(`  OCR page ${i + 1}/${pageFiles.length}: ${trimmed.length} chars`);
+        } catch (e) {
+          console.warn(`  OCR page ${i + 1} failed:`, e.message);
+        }
+      }
+
+      await worker.terminate();
+      return texts.join('\n\n');
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -67,18 +134,41 @@ class PdfService {
         return libraryTables;
       } else if (textTables.count > 0) {
         return textTables;
-      } else {
-        return {
-          tables: [],
-          count: 0,
-          summary: {
-            totalRows: 0,
-            totalColumns: 0,
-            averageColumns: 0,
-            pagesWithTables: 0
-          }
-        };
       }
+
+      // Both methods found nothing — try OCR fallback for scanned PDFs
+      console.log('📷 No tables found via standard methods — trying OCR fallback');
+      try {
+        const ocrText = await this._ocrFromBuffer(buffer);
+        if (ocrText.trim().length > 0) {
+          const lines = ocrText.split('\n').map(l => l.trimEnd());
+          const rawTables = this._extractTablesFromLines(lines);
+          const validTables = rawTables.filter(t => t.rows.length >= 2 &&
+            Math.max(...t.rows.map(r => r.length)) >= 2);
+          if (validTables.length > 0) {
+            console.log(`  OCR found ${validTables.length} table(s)`);
+            return {
+              tables: validTables,
+              count: validTables.length,
+              ocr: true,
+              summary: {
+                totalRows: validTables.reduce((s, t) => s + t.rowCount, 0),
+                totalColumns: validTables.reduce((s, t) => s + t.columnCount, 0),
+                averageColumns: Math.round(validTables.reduce((s, t) => s + t.columnCount, 0) / validTables.length * 10) / 10,
+                pagesWithTables: validTables.length
+              }
+            };
+          }
+        }
+      } catch (ocrErr) {
+        console.warn('⚠️  OCR table fallback failed:', ocrErr.message);
+      }
+
+      return {
+        tables: [],
+        count: 0,
+        summary: { totalRows: 0, totalColumns: 0, averageColumns: 0, pagesWithTables: 0 }
+      };
     } catch (error) {
       throw new Error(`Failed to extract tables from PDF: ${error.message}`);
     }
@@ -469,6 +559,150 @@ async extractImagesFromBuffer(buffer) {
   async generateScreenshotsFromUrl(url, options = {}) {
     const buffer = await this.downloadPdf(url);
     return await this.generateScreenshotsFromBuffer(buffer, options);
+  }
+
+  // ── Universal document text extractor ──────────────────────────
+
+  /**
+   * Detect document format from buffer magic bytes + MIME type hint
+   */
+  _detectFormat(buffer, mimeType) {
+    const mime = (mimeType || '').toLowerCase();
+    // DOCX: ZIP signature (PK\x03\x04) + Office MIME
+    if (
+      mime.includes('wordprocessingml') ||
+      mime.includes('docx') ||
+      (buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04)
+    ) return 'docx';
+    // RTF: starts with {\rtf
+    if (
+      mime.includes('rtf') ||
+      buffer.slice(0, 5).toString('ascii') === '{\\rtf'
+    ) return 'rtf';
+    // PDF: starts with %PDF
+    if (
+      mime.includes('pdf') ||
+      buffer.slice(0, 4).toString('ascii') === '%PDF'
+    ) return 'pdf';
+    // ODT: ZIP + oasis MIME
+    if (mime.includes('opendocument')) return 'odt';
+    // Plain text fallback
+    return 'txt';
+  }
+
+  /**
+   * Strip RTF markup — returns plain text without external deps
+   */
+  _stripRtf(buffer) {
+    const raw = buffer.toString('latin1');
+    let out = '';
+    let depth = 0;
+    let skip = false;
+    let i = 0;
+    while (i < raw.length) {
+      const ch = raw[i];
+      if (ch === '{') { depth++; i++; continue; }
+      if (ch === '}') { depth--; skip = false; i++; continue; }
+      if (ch === '\\') {
+        i++;
+        // Unicode escape \uN
+        if (raw[i] === 'u' && /\d/.test(raw[i + 1])) {
+          i++;
+          let num = '';
+          while (/\d/.test(raw[i])) { num += raw[i++]; }
+          if (raw[i] === ' ') i++;
+          const code = parseInt(num, 10);
+          out += code > 0 ? String.fromCharCode(code) : '';
+          continue;
+        }
+        // Control word
+        let word = '';
+        while (i < raw.length && /[a-zA-Z]/.test(raw[i])) word += raw[i++];
+        let param = '';
+        if (raw[i] === '-' || /\d/.test(raw[i])) {
+          if (raw[i] === '-') { param += '-'; i++; }
+          while (/\d/.test(raw[i])) param += raw[i++];
+        }
+        if (raw[i] === ' ') i++;
+        // Skip hidden groups
+        if (word === '*') { skip = true; continue; }
+        if (['pntext','fonttbl','colortbl','stylesheet','info','header','footer','footnote','object','pict'].includes(word)) skip = true;
+        if (word === 'par' || word === 'line') out += '\n';
+        if (word === 'tab') out += '\t';
+        continue;
+      }
+      if (!skip && depth > 0) out += ch;
+      i++;
+    }
+    return out.replace(/\r?\n\r?\n+/g, '\n\n').trim();
+  }
+
+  /**
+   * Extract plain text from any supported document format.
+   * Supports: PDF, DOCX, TXT, RTF.
+   * Returns { text, pageCount, format }.
+   */
+  async extractTextFromAnyBuffer(buffer, mimeType) {
+    const format = this._detectFormat(buffer, mimeType);
+    console.log(`📄 extractTextFromAnyBuffer: format=${format} size=${buffer.length}`);
+
+    switch (format) {
+      case 'pdf':
+        return this.extractTextFromBuffer(buffer);
+
+      case 'docx': {
+        const result = await mammoth.extractRawText({ buffer });
+        const text = result.value.trim();
+        if (!text) throw new Error('DOCX не содержит текстового контента');
+        // Approximate page count: ~3000 chars per page
+        const pageCount = Math.max(1, Math.ceil(text.length / 3000));
+        return { text, pageCount, format: 'docx' };
+      }
+
+      case 'rtf': {
+        const text = this._stripRtf(buffer);
+        if (!text) throw new Error('RTF не содержит текстового контента');
+        const pageCount = Math.max(1, Math.ceil(text.length / 3000));
+        return { text, pageCount, format: 'rtf' };
+      }
+
+      case 'odt': {
+        // ODT is a ZIP — extract content.xml and strip tags
+        // Simple approach: find XML text nodes
+        try {
+          const AdmZip = require('adm-zip');
+          const zip = new AdmZip(buffer);
+          const entry = zip.getEntry('content.xml');
+          if (!entry) throw new Error('content.xml не найден в ODT');
+          const xml = entry.getData().toString('utf-8');
+          const text = xml
+            .replace(/<text:p[^>]*>/g, '\n')
+            .replace(/<text:line-break\/>/g, '\n')
+            .replace(/<text:tab\/>/g, '\t')
+            .replace(/<[^>]+>/g, '')
+            .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&apos;/g, "'").replace(/&quot;/g, '"')
+            .trim();
+          const pageCount = Math.max(1, Math.ceil(text.length / 3000));
+          return { text, pageCount, format: 'odt' };
+        } catch (e) {
+          throw new Error(`Не удалось прочитать ODT: ${e.message}`);
+        }
+      }
+
+      case 'txt':
+      default: {
+        // Try UTF-8, fall back to latin1
+        let text;
+        try {
+          text = buffer.toString('utf-8').trim();
+        } catch {
+          text = buffer.toString('latin1').trim();
+        }
+        if (!text) throw new Error('Файл пустой');
+        const pageCount = Math.max(1, Math.ceil(text.length / 3000));
+        return { text, pageCount, format: 'txt' };
+      }
+    }
   }
 }
 

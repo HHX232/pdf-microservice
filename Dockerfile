@@ -7,6 +7,9 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
+# poppler-utils provides pdftoppm for PDF→image rendering (needed for OCR fallback)
+RUN apk add --no-cache poppler-utils
+
 RUN npm ci --only=production
 
 # Copy source code
